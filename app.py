@@ -7,6 +7,8 @@ import numpy as np
 import shap
 import matplotlib.pyplot as plt
 
+# Updated version: clear row delete buttons + one-time balloons after Run Prediction.
+
 # --- 1. SETTINGS & ASSETS ---
 st.set_page_config(page_title="Staph Oxacillin Predictor", layout="wide")
 
@@ -53,20 +55,40 @@ def reset_app():
     st.rerun()
 
 
+def next_row_id(counter_key):
+    if counter_key not in st.session_state:
+        st.session_state[counter_key] = 0
+    st.session_state[counter_key] += 1
+    return st.session_state[counter_key]
+
+
+def ensure_row_ids(list_key, counter_key):
+    if list_key not in st.session_state:
+        st.session_state[list_key] = []
+    for row in st.session_state[list_key]:
+        if "_id" not in row:
+            row["_id"] = next_row_id(counter_key)
+
+
+def safe_class_index(value):
+    return ABX_CLASSES.index(value) if value in ABX_CLASSES else 0
+
+
 # --- 2. FEATURE BUILDING HELPERS ---
 def calculate_current_abx_features(abx_list):
-    """Current app behavior: one current exposure value per antibiotic class."""
+    """Current prediction: one decayed exposure value per antibiotic class."""
     abx_features = {cls: 0.0 for cls in ABX_CLASSES}
     for entry in abx_list:
         cls = entry.get("class", "BLBI")
         dur = float(entry.get("dur", 0) or 0)
         last = float(entry.get("last", 0) or 0)
-        abx_features[cls] = dur * np.exp(-LAMBDA_DECAY * last)
+        if cls in abx_features:
+            abx_features[cls] = dur * np.exp(-LAMBDA_DECAY * last)
     return abx_features
 
 
 def overlap_duration(start, end, window_start, window_end):
-    """Continuous overlap length between [start, end] and (window_start, window_end]."""
+    """Overlap length between [start, end] and (window_start, window_end]."""
     left = max(start, window_start)
     right = min(end, window_end)
     return max(0.0, right - left)
@@ -76,12 +98,10 @@ def calculate_trend_abx_features(past_abx_list, plan_abx_list, future_day):
     """
     Calculate antibiotic exposure for a future day.
 
-    Duration is the total number of treatment days for each antibiotic class that falls
-    inside the previous 90-day window. If the same class appears in both past exposure
-    and the future antibiotic plan, the duration is summed across both sources.
-
-    Days since last dose uses the future plan for that class when a planned antibiotic
-    exists; otherwise it uses the most recent past dose.
+    For each class, Duration is the sum of all treatment days that remain inside
+    the previous 90-day window. If a past antibiotic is restarted in the plan,
+    past + planned days are summed, but days since last dose follows the planned
+    antibiotic.
     """
     exposures = {cls: 0.0 for cls in ABX_CLASSES}
     window_start = future_day - 90
@@ -92,7 +112,7 @@ def calculate_trend_abx_features(past_abx_list, plan_abx_list, future_day):
         past_last_values = []
         plan_durations = []
 
-        # Past antibiotics: interval ends before/at day 0.
+        # Past antibiotics: interval ends before or at day 0.
         # Example: duration=20, last=0 gives interval [-20, 0].
         for entry in past_abx_list:
             if entry.get("class") != cls:
@@ -123,11 +143,9 @@ def calculate_trend_abx_features(past_abx_list, plan_abx_list, future_day):
             continue
 
         if plan_durations:
-            # Use the latest planned dose when this class is restarted/planned.
             latest_plan_end = max(plan_durations)
             days_since_last_dose = max(0.0, future_day - latest_plan_end)
         elif past_last_values:
-            # Use the most recent past dose when there is no planned antibiotic of this class.
             days_since_last_dose = future_day + min(past_last_values)
         else:
             days_since_last_dose = 0.0
@@ -196,11 +214,10 @@ def build_trend_dataframe(baseline, plan_abx_list, discharge_plan_days):
                 previous_discharge_days=previous_discharge_future,
                 abx_features=abx_features,
             )
-            prob = predict_probability(df)
             rows.append({
                 "Day": day,
                 "Sample Type": sample_type,
-                "Probability": prob * 100,
+                "Probability": predict_probability(df) * 100,
             })
 
     return pd.DataFrame(rows)
@@ -242,21 +259,58 @@ st.divider()
 
 # --- 5. ANTIBIOTICS ---
 st.subheader("Antibiotics (Past 3 Months)")
-if "abx_list" not in st.session_state:
-    st.session_state.abx_list = []
+ensure_row_ids("abx_list", "abx_row_counter")
 
 
 def add_abx():
-    st.session_state.abx_list.append({"class": "BLBI", "dur": 0, "last": 0})
+    st.session_state.abx_list.append({
+        "_id": next_row_id("abx_row_counter"),
+        "class": "BLBI",
+        "dur": 0,
+        "last": 0,
+    })
+
+
+def delete_abx(row_id):
+    st.session_state.abx_list = [
+        row for row in st.session_state.abx_list
+        if row.get("_id") != row_id
+    ]
+    for key in [f"abx_class_{row_id}", f"abx_dur_{row_id}", f"abx_last_{row_id}"]:
+        st.session_state.pop(key, None)
+    # Old prediction/trend can become stale after row deletion.
+    st.session_state.pop("trend_df", None)
 
 
 st.button("➕ Add Antibiotic Row", on_click=add_abx)
 
 for i, entry in enumerate(st.session_state.abx_list):
-    c1, c2, c3 = st.columns(3)
-    entry["class"] = c1.selectbox(f"Class #{i + 1}", ABX_CLASSES, key=f"c_{i}")
-    entry["dur"] = c2.number_input(f"Duration (days) #{i + 1}", min_value=0, key=f"d_{i}")
-    entry["last"] = c3.number_input(f"Days since last dose #{i + 1}", min_value=0, key=f"l_{i}")
+    row_id = entry["_id"]
+    c1, c2, c3, c4 = st.columns([3.0, 3.0, 3.0, 1.4])
+
+    entry["class"] = c1.selectbox(
+        f"Class #{i + 1}",
+        ABX_CLASSES,
+        index=safe_class_index(entry.get("class", "BLBI")),
+        key=f"abx_class_{row_id}",
+    )
+    entry["dur"] = c2.number_input(
+        f"Duration (days) #{i + 1}",
+        min_value=0,
+        value=int(entry.get("dur", 0) or 0),
+        key=f"abx_dur_{row_id}",
+    )
+    entry["last"] = c3.number_input(
+        f"Days since last dose #{i + 1}",
+        min_value=0,
+        value=int(entry.get("last", 0) or 0),
+        key=f"abx_last_{row_id}",
+    )
+    c4.write("")
+    c4.write("")
+    if c4.button("🗑️ Remove", key=f"delete_abx_{row_id}", use_container_width=True):
+        delete_abx(row_id)
+        st.rerun()
 
 current_abx_features = calculate_current_abx_features(st.session_state.abx_list)
 
@@ -298,12 +352,18 @@ if st.button("🚀 RUN PREDICTION", type="primary", use_container_width=True):
         "previous_discharge_days": prev_val,
         "past_abx_list": [dict(x) for x in st.session_state.abx_list],
     }
+    st.session_state.pop("trend_df", None)
+
+    # Trigger balloons once for this prediction click only.
+    st.session_state.show_prediction_balloons_once = True
+
+if st.session_state.pop("show_prediction_balloons_once", False):
+    st.balloons()
 
 if st.session_state.get("prediction_done", False):
     prob = st.session_state.latest_probability
     df_final = st.session_state.latest_df
 
-    st.balloons()
     st.markdown(f"### Predicted Probability of Resistance: **{prob * 100:.2f}%**")
 
     st.subheader("Feature Influence (Probability Scale)")
@@ -339,18 +399,46 @@ if st.session_state.get("prediction_done", False):
     st.divider()
     st.subheader("Antibiotic Plan")
 
-    if "plan_abx_list" not in st.session_state:
-        st.session_state.plan_abx_list = []
+    ensure_row_ids("plan_abx_list", "plan_abx_row_counter")
 
     def add_plan_abx():
-        st.session_state.plan_abx_list.append({"class": "BLBI", "dur": 0})
+        st.session_state.plan_abx_list.append({
+            "_id": next_row_id("plan_abx_row_counter"),
+            "class": "BLBI",
+            "dur": 0,
+        })
+
+    def delete_plan_abx(row_id):
+        st.session_state.plan_abx_list = [
+            row for row in st.session_state.plan_abx_list
+            if row.get("_id") != row_id
+        ]
+        for key in [f"plan_class_{row_id}", f"plan_dur_{row_id}"]:
+            st.session_state.pop(key, None)
+        st.session_state.pop("trend_df", None)
 
     st.button("➕ Add Antibiotic Plan Row", on_click=add_plan_abx)
 
     for i, entry in enumerate(st.session_state.plan_abx_list):
-        c1, c2 = st.columns(2)
-        entry["class"] = c1.selectbox(f"Plan Class #{i + 1}", ABX_CLASSES, key=f"pc_{i}")
-        entry["dur"] = c2.number_input(f"Plan Duration (days) #{i + 1}", min_value=0, key=f"pd_{i}")
+        row_id = entry["_id"]
+        c1, c2, c3 = st.columns([4.0, 4.0, 1.4])
+        entry["class"] = c1.selectbox(
+            f"Plan Class #{i + 1}",
+            ABX_CLASSES,
+            index=safe_class_index(entry.get("class", "BLBI")),
+            key=f"plan_class_{row_id}",
+        )
+        entry["dur"] = c2.number_input(
+            f"Plan Duration (days) #{i + 1}",
+            min_value=0,
+            value=int(entry.get("dur", 0) or 0),
+            key=f"plan_dur_{row_id}",
+        )
+        c3.write("")
+        c3.write("")
+        if c3.button("🗑️ Remove", key=f"delete_plan_abx_{row_id}", use_container_width=True):
+            delete_plan_abx(row_id)
+            st.rerun()
 
     discharge_plan = st.number_input(
         "Discharge Plan (days)",
